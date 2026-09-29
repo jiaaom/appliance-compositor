@@ -34,6 +34,9 @@
  *   close  <sel>          ask the client to close (xdg_toplevel.close)
  *   rotate <sel> <deg>    0, 90, 180 or 270 (clockwise)
  *   layer  <sel> <n>      move to another layer
+ *   set-output <app-id> <output>
+ *                         point the app-id's rule at another output (until
+ *                         the compositor restarts) and move its windows
  *
  * <sel> is "#<id>" for one window or an app-id for every top-level window
  * with that app-id. Commands act on top-level windows and carry their
@@ -168,10 +171,14 @@ cmd_list(struct ash_shell *shell, struct ash_out *o)
 		out_str(o, ",\"title\":");
 		out_json_string(o, ash_surface_title(s));
 		out_fmt(o, ",\"parent\":%u,\"layer\":%d,\"rotation\":%d,"
-			   "\"hidden\":%s,\"mapped\":%s,\"focused\":%s,"
+			   "\"focus_priority\":%d,"
+			   "\"hidden\":%s,\"no_output\":%s,"
+			   "\"mapped\":%s,\"focused\":%s,"
 			   "\"width\":%d,\"height\":%d,\"output\":",
 			s->parent ? s->parent->id : 0, s->layer, s->rotation,
+			s->focus_priority,
 			s->hidden ? "true" : "false",
+			s->no_output ? "true" : "false",
 			weston_surface_is_mapped(surface) ? "true" : "false",
 			ash_surface_is_focused(s) ? "true" : "false",
 			surface->width, surface->height);
@@ -248,6 +255,16 @@ handle_line(struct ash_shell *shell, char *line, struct ash_out *o)
 
 	if (strcmp(argv[0], "list") == 0) {
 		cmd_list(shell, o);
+		return;
+	}
+
+	if (strcmp(argv[0], "set-output") == 0) {
+		if (argc < 3) {
+			reply_error(o, "usage: set-output <app-id> <output>");
+			return;
+		}
+		out_fmt(o, "{\"ok\":true,\"moved\":%d}\n",
+			ash_set_rule_output(shell, argv[1], argv[2]));
 		return;
 	}
 

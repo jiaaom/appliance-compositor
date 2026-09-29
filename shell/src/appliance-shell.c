@@ -101,6 +101,14 @@ ash_surface_is_descendant_of(struct ash_surface *shsurf,
 	return false;
 }
 
+/* Visible: not hidden by a command, and its top-level window has an output
+ * (see output-fallback). */
+static bool
+ash_surface_is_shown(struct ash_surface *shsurf)
+{
+	return !shsurf->hidden && !ash_surface_root(shsurf)->no_output;
+}
+
 static bool
 ash_surface_is_mapped(struct ash_surface *shsurf)
 {
@@ -131,6 +139,7 @@ ash_load_rules(struct ash_shell *shell)
 
 	while (weston_config_next_section(shell->config, &section, &name)) {
 		struct ash_rule *rule;
+		char *fallback;
 		int32_t rotation;
 
 		if (strcmp(name, "appliance-rule") != 0)
@@ -153,8 +162,14 @@ ash_load_rules(struct ash_shell *shell)
 		rule->rotation = ((rotation % 360) + 360) % 360 / 90 * 90;
 		weston_config_section_get_bool(section, "focusable",
 					       &rule->focusable, true);
+		weston_config_section_get_int(section, "focus-priority",
+					      &rule->focus_priority, 0);
 		weston_config_section_get_string(section, "output",
 						 &rule->output, NULL);
+		weston_config_section_get_string(section, "output-fallback",
+						 &fallback, NULL);
+		rule->output_fallback = !fallback || strcmp(fallback, "none") != 0;
+		free(fallback);
 
 		wl_list_insert(shell->rule_list.prev, &rule->link);
 	}
@@ -289,6 +304,29 @@ ash_output_create(struct ash_shell *shell, struct weston_output *output)
  * geometry: fullscreen size, rotation
  */
 
+static bool
+ash_rule_wants_hidden(struct ash_rule *rule, struct weston_output *output);
+
+static void
+ash_restack_idle(void *data)
+{
+	struct ash_shell *shell = data;
+
+	shell->restack_idle = NULL;
+	ash_restack(shell);
+}
+
+static void
+ash_schedule_restack(struct ash_shell *shell)
+{
+	struct wl_event_loop *loop;
+
+	if (shell->restack_idle)
+		return;
+	loop = wl_display_get_event_loop(shell->compositor->wl_display);
+	shell->restack_idle = wl_event_loop_add_idle(loop, ash_restack_idle, shell);
+}
+
 static void
 ash_surface_output_destroyed(struct wl_listener *listener, void *data)
 {
@@ -298,6 +336,19 @@ ash_surface_output_destroyed(struct wl_listener *listener, void *data)
 	wl_list_remove(&shsurf->output_destroy_listener.link);
 	wl_list_init(&shsurf->output_destroy_listener.link);
 	shsurf->output = NULL;
+
+	/* its screen is gone: with output-fallback=none it hides (and gives up
+	 * the keyboard) until the output is back; others keep today's
+	 * behaviour. Restack later, not inside the output's destroy signal. */
+	if (!shsurf->parent && shsurf->rule_applied) {
+		struct ash_rule *rule = ash_find_rule(shsurf->shell,
+			weston_desktop_surface_get_app_id(shsurf->desktop_surface));
+
+		if (ash_rule_wants_hidden(rule, NULL)) {
+			shsurf->no_output = true;
+			ash_schedule_restack(shsurf->shell);
+		}
+	}
 }
 
 static void
@@ -321,11 +372,22 @@ ash_surface_pick_output(struct ash_surface *shsurf, struct ash_rule *rule)
 	if (shsurf->parent)
 		return ash_surface_root(shsurf)->output;
 
-	if (rule && rule->output)
+	if (rule && rule->output) {
 		output = ash_output_by_name(shsurf->shell, rule->output);
+		/* output-fallback=none: no other screen, stay hidden */
+		if (!output && !rule->output_fallback)
+			return NULL;
+	}
 	if (!output)
 		output = weston_shell_utils_get_default_output(ec);
 	return output;
+}
+
+/* Would this window's rule have it hidden for lack of its output? */
+static bool
+ash_rule_wants_hidden(struct ash_rule *rule, struct weston_output *output)
+{
+	return rule && rule->output && !rule->output_fallback && !output;
 }
 
 /* Ask a top-level window for the full output size, swapped when it is
@@ -467,19 +529,43 @@ ash_surface_focus(struct ash_surface *shsurf)
 	weston_desktop_surface_set_activated(shsurf->desktop_surface, true);
 }
 
-/* Give keyboard focus to the topmost visible focusable window. */
+/* A window's focus priority: its rule's, or its top-level parent's for a
+ * child window (a dialog belongs with its app). */
+static int
+ash_surface_focus_priority(struct ash_surface *s)
+{
+	while (s->parent)
+		s = s->parent;
+	return s->focus_priority;
+}
+
+/* Give keyboard focus to the visible focusable window with the highest focus
+ * priority, the topmost one among equals. The stack spans every output, so
+ * without priorities the topmost window anywhere wins: a screensaver on one
+ * screen would take the keys from an app on another (a TV, driven by a
+ * remote). */
 static void
 ash_refocus(struct ash_shell *shell)
 {
-	struct ash_surface *s;
+	struct ash_surface *s, *best = NULL;
+	int best_priority = 0;
 
 	wl_list_for_each(s, &shell->stack, link) {
-		if (s->hidden || !s->focusable || !ash_surface_is_mapped(s))
+		int priority;
+
+		if (!ash_surface_is_shown(s) || !s->focusable ||
+		    !ash_surface_is_mapped(s))
 			continue;
-		ash_surface_focus(s);
-		return;
+		priority = ash_surface_focus_priority(s);
+		if (!best || priority > best_priority) {
+			best = s;
+			best_priority = priority;
+		}
 	}
-	shell->focused_surface = NULL;
+	if (best)
+		ash_surface_focus(best);
+	else
+		shell->focused_surface = NULL;
 }
 
 /* Rebuild the layers from the stack, bottom to top (move_to_layer inserts at
@@ -493,13 +579,13 @@ ash_restack(struct ash_shell *shell)
 		if (!ash_surface_is_mapped(s))
 			continue;
 		weston_view_move_to_layer(s->view,
-					  s->hidden ? &shell->hidden_layer.view_list
-						    : &shell->normal_layer.view_list);
+					  ash_surface_is_shown(s) ? &shell->normal_layer.view_list
+								  : &shell->hidden_layer.view_list);
 	}
 
 	if (shell->focused_surface) {
 		struct ash_surface *f = get_ash_surface(shell->focused_surface);
-		if (!f || f->hidden)
+		if (!f || !ash_surface_is_shown(f))
 			shell->focused_surface = NULL;
 	}
 	ash_refocus(shell);
@@ -658,10 +744,82 @@ ash_surface_apply_rule(struct ash_surface *shsurf)
 		shsurf->layer = rule->layer;
 		shsurf->rotation = rule->rotation;
 		shsurf->focusable = rule->focusable;
+		shsurf->focus_priority = rule->focus_priority;
 	}
 	ash_surface_set_output(shsurf, ash_surface_pick_output(shsurf, rule));
+	shsurf->no_output = ash_rule_wants_hidden(rule, shsurf->output);
 	ash_surface_configure_fullscreen(shsurf);
 	ash_stack_move_group(shell, shsurf, true);
+}
+
+/* Put a top-level window (and its children) where its rule says now: on the
+ * rule's output if connected, else the default output or, with
+ * output-fallback=none, hidden until the output appears. Used when a rule
+ * changes (set-output) and when outputs come and go. Returns whether the
+ * window moved or changed visibility. */
+static bool
+ash_surface_rehome(struct ash_surface *root)
+{
+	struct ash_shell *shell = root->shell;
+	struct ash_rule *rule;
+	struct weston_output *output;
+	struct ash_surface *s;
+	bool no_output;
+
+	if (root->parent || !root->rule_applied)
+		return false;
+	rule = ash_find_rule(shell, weston_desktop_surface_get_app_id(
+						root->desktop_surface));
+	output = ash_surface_pick_output(root, rule);
+	no_output = ash_rule_wants_hidden(rule, output);
+	if (output == root->output && no_output == root->no_output)
+		return false;
+
+	root->no_output = no_output;
+	wl_list_for_each(s, &shell->stack, link) {
+		if (!ash_surface_is_descendant_of(s, root))
+			continue;
+		ash_surface_set_output(s, output);
+		if (s == root)
+			ash_surface_configure_fullscreen(s);
+		/* same size: no new commit will place it, so place it now */
+		if (ash_surface_is_mapped(s))
+			ash_surface_place(s);
+	}
+	return true;
+}
+
+/* set-output: point an app-id's rule at another output (creating the rule if
+ * there is none) and move its windows there. Lasts until the compositor
+ * restarts, when the clients' fragments are read again. Returns the number of
+ * windows moved. */
+int
+ash_set_rule_output(struct ash_shell *shell, const char *app_id,
+		    const char *output_name)
+{
+	struct ash_rule *rule = ash_find_rule(shell, app_id);
+	struct ash_surface *s;
+	int n = 0;
+
+	if (!rule) {
+		rule = zalloc(sizeof *rule);
+		if (!rule)
+			return 0;
+		rule->app_id = strdup(app_id);
+		rule->focusable = true;
+		rule->output_fallback = true;
+		wl_list_insert(shell->rule_list.prev, &rule->link);
+	}
+	free(rule->output);
+	rule->output = strdup(output_name);
+
+	wl_list_for_each(s, &shell->stack, link)
+		if (!s->parent &&
+		    strcmp(ash_surface_app_id(s), app_id) == 0 &&
+		    ash_surface_rehome(s))
+			n++;
+	ash_restack(shell);
+	return n;
 }
 
 /*
@@ -850,8 +1008,18 @@ ash_handle_output_created(struct wl_listener *listener, void *data)
 {
 	struct ash_shell *shell =
 		container_of(listener, shell, output_created_listener);
+	struct ash_surface *s;
+	bool changed = false;
 
 	ash_output_create(shell, data);
+
+	/* windows whose rule names this output (placed elsewhere or hidden
+	 * while it was not connected) move to it */
+	wl_list_for_each(s, &shell->stack, link)
+		if (!s->parent && ash_surface_rehome(s))
+			changed = true;
+	if (changed)
+		ash_restack(shell);
 }
 
 static void
@@ -950,6 +1118,9 @@ ash_shell_destroy(struct wl_listener *listener, void *data)
 	wl_list_remove(&shell->output_moved_listener.link);
 	wl_list_remove(&shell->seat_created_listener.link);
 	wl_list_remove(&shell->session_listener.link);
+
+	if (shell->restack_idle)
+		wl_event_source_remove(shell->restack_idle);
 
 	wl_list_for_each_safe(shoutput, otmp, &shell->output_list, link)
 		ash_output_destroy(shoutput);

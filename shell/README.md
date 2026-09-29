@@ -26,9 +26,11 @@ Applications need no changes: they are ordinary `xdg-shell` clients.
   rotated size, so it lays out in landscape on a portrait panel. The
   compositor maps touch and pointer input back to it.
 - **Fullscreen top-levels on a chosen output.** Child windows (dialogs) stay
-  with their parent.
-- **Keyboard focus** follows the topmost visible `focusable` window, or is
-  set explicitly.
+  with their parent. A window moves to its output when that output is
+  connected later, and a supervisor can move it to another one at run time
+  (`set-output`) without restarting the compositor.
+- **Keyboard focus** follows the visible `focusable` window with the highest
+  `focus-priority`, the topmost among equals, or is set explicitly.
 - **Control socket** for a supervising process.
 
 ## appliance-screensaver
@@ -112,7 +114,9 @@ See `examples/weston.ini`.
 | `layer` | `0` | stacking layer; higher is above |
 | `rotation` | `0` | initial rotation, clockwise degrees (0/90/180/270) |
 | `focusable` | `true` | may receive keyboard focus |
+| `focus-priority` | `0` | keyboard focus goes to the visible window with the highest priority, the topmost among equals (e.g. a TV app above a front panel's screensaver on another screen); child windows use their parent's |
 | `output` | default output | output name to open on |
+| `output-fallback` | `default` | when `output` is not connected: `default` opens on the default output; `none` keeps the window hidden (and away from the keyboard) until that output appears, and hides it again when it goes |
 
 ### `[appliance-shell]` keys
 
@@ -129,13 +133,14 @@ command per line and answers one JSON object per line.
 
 | command | effect |
 |---|---|
-| `list` | all windows, topmost first: id, app_id, title, parent, layer, rotation, hidden, mapped, focused, size, output |
+| `list` | all windows, topmost first: id, app_id, title, parent, layer, rotation, focus_priority, hidden, no_output, mapped, focused, size, output |
 | `raise <sel>` / `lower <sel>` | top / bottom of its layer |
 | `hide <sel>` / `show <sel>` | unmap / remap without closing |
 | `focus <sel>` | keyboard focus |
 | `close <sel>` | ask the client to close |
 | `rotate <sel> <deg>` | 0, 90, 180, 270 |
 | `layer <sel> <n>` | move to another layer |
+| `set-output <app-id> <output>` | point the app-id's rule at another output and move its windows there (answers `{"ok":true,"moved":n}`); later windows of the app-id open there too. Lasts until the compositor restarts, so keep the config in step |
 
 `<sel>` is `#<id>` for one window, or an app-id for every top-level window
 with that app-id. Commands act on a whole window tree (a window and its

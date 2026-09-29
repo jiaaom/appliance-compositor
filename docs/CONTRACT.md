@@ -84,7 +84,8 @@ weston.ini fragments, one file per client package, named after it. Only two
 section types are allowed; anything else is ignored with a warning:
 
 - `[appliance-rule]` — window placement for the client's app-ids (keys in
-  `shell/README.md`: `app-id`, `layer`, `rotation`, `focusable`, `output`).
+  `shell/README.md`: `app-id`, `layer`, `rotation`, `focusable`,
+  `focus-priority`, `output`, `output-fallback`).
 - `[output]` — settings for an output the client owns (weston's keys:
   `name`, `scale`, `transform`, `mode`, …).
 
@@ -92,6 +93,22 @@ Layer numbers: `0–49` clients' normal windows, `50–99` overlays, `100` and u
 screensavers. A client that runs `appliance-screensaver` for its own screen
 gives it its own app-id (`--app-id`) and a rule `layer=100` + `output=`; the
 compositor's base rule for the default app-id `screensaver` has no output.
+
+Keyboard focus: there is one keyboard (and remote) for all screens. It goes
+to the visible focusable window with the highest `focus-priority` (default
+0), the topmost among equals. The stack spans every output, so without a
+priority a screensaver on one screen would take the keys from an app on
+another. Priorities: `0` default (front panels, their players and
+screensavers), `10` an app that owns the remote while it runs (a TV app).
+Touching a window never moves the focus. Older compositors ignore the key.
+
+Outputs that come and go (a TV): a rule with `output-fallback=none` keeps
+the window hidden while its output is not connected, instead of opening it
+on the default output (another app's screen). To move an app to another
+output without restarting the compositor, write the new fragment (for the
+next start) and send `set-output <app-id> <output>` on the control socket.
+A compositor without it answers `{"ok":false,"error":"unknown command"}`:
+fall back to restarting `appliance-compositor.service`.
 
 The compositor merges its own base config with all fragments (sorted by
 file name) into the weston.ini it starts with. A client's install writes its

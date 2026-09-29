@@ -41,7 +41,11 @@ struct ash_rule {
 	int layer;			/* higher stacks above lower */
 	int rotation;			/* initial rotation: 0/90/180/270 */
 	bool focusable;			/* may take keyboard focus */
+	int focus_priority;		/* higher takes keyboard focus first */
 	char *output;			/* output name to open on, or NULL */
+	bool output_fallback;		/* output missing: use the default one
+					 * (true) or stay hidden until it
+					 * appears (false, output-fallback=none) */
 };
 
 struct ash_shell {
@@ -69,6 +73,7 @@ struct ash_shell {
 
 	struct weston_seat *seat;
 	struct weston_surface *focused_surface;
+	struct wl_event_source *restack_idle;	/* a deferred ash_restack */
 
 	uint32_t next_id;
 
@@ -105,7 +110,10 @@ struct ash_surface {
 	bool rule_applied;
 	int layer;
 	bool focusable;
-	bool hidden;
+	int focus_priority;		/* from the rule; children use their root's */
+	bool hidden;			/* by a control command */
+	bool no_output;			/* top-level: its rule's output is not
+					 * connected (output-fallback=none) */
 
 	int rotation;			/* 0/90/180/270, clockwise */
 	struct weston_transform rotate;
@@ -132,6 +140,9 @@ void
 ash_surface_set_hidden(struct ash_surface *shsurf, bool hidden);
 void
 ash_surface_set_layer(struct ash_surface *shsurf, int layer);
+int
+ash_set_rule_output(struct ash_shell *shell, const char *app_id,
+		    const char *output_name);
 void
 ash_surface_focus(struct ash_surface *shsurf);
 const char *
