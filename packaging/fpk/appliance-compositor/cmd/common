@@ -1,0 +1,320 @@
+# Shared definitions for the appliance-compositor lifecycle scripts (sourced,
+# not executed). What client apps may rely on is docs/CONTRACT.md; keep the
+# paths and unit names below in step with it.
+
+ETC=/etc/appliance-compositor
+STATE=/var/lib/appliance-compositor
+LINK=/usr/local/lib/appliance-compositor
+COMPOSITOR_UNIT=appliance-compositor
+AUDIO_UNITS="appliance-audio appliance-audio-session appliance-audio-pulse"
+UNITS="$COMPOSITOR_UNIT $AUDIO_UNITS"
+LOG_TAG=appliance-compositor
+
+fail() {
+    echo "$*" > "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+    exit 1
+}
+
+# ---- system packages ------------------------------------------------------
+#
+# Installed the way App Center runs us: as root, without a terminal. Waits for
+# another apt/dpkg run instead of failing on its lock, and refreshes the
+# package lists once if the first attempt fails (stale lists are the usual
+# cause). apt's output goes to `journalctl -t appliance-compositor-apt`.
+# App Center shows fail() text verbatim in its error dialog, newlines included.
+APT_TAG=appliance-compositor-apt
+apt_try_install() {
+    local opts=(-y -q --no-install-recommends -o DPkg::Lock::Timeout=120)
+    export DEBIAN_FRONTEND=noninteractive
+    logger -t "$APT_TAG" "apt-get install $*"
+    apt-get "${opts[@]}" install "$@" 2>&1 | logger -t "$APT_TAG"
+    [ "${PIPESTATUS[0]}" -eq 0 ] && return 0
+    apt-get -q -o DPkg::Lock::Timeout=120 update 2>&1 | logger -t "$APT_TAG"
+    apt-get "${opts[@]}" install "$@" 2>&1 | logger -t "$APT_TAG"
+    return "${PIPESTATUS[0]}"
+}
+pkg_version() { dpkg-query -W -f='${Version}' "$1" 2>/dev/null; }
+pkg_installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; }
+
+# weston 14 (bookworm-backports; Debian 12 itself has 10): appliance-shell is
+# built against libweston 14. A newer weston still runs, with kiosk-shell.
+WESTON_MIN=14
+check_weston() {
+    local ver
+    ver=$(pkg_version weston) || ver=""
+    [ -n "$ver" ] && dpkg --compare-versions "$ver" ge "$WESTON_MIN" && return 0
+    logger -t "$LOG_TAG" "weston ${ver:-missing}; installing from bookworm-backports"
+    apt_try_install -t bookworm-backports weston
+    ver=$(pkg_version weston) || ver=""
+    [ -n "$ver" ] && dpkg --compare-versions "$ver" ge "$WESTON_MIN" && return 0
+    fail "Appliance Compositor needs weston $WESTON_MIN or newer, and installing it automatically failed (details: journalctl -t $APT_TAG).
+Installed: ${ver:-none}.
+Run as root over SSH, then install again:
+apt install -t bookworm-backports weston"
+}
+
+# A Mesa that knows current Intel GPUs (e.g. Meteor Lake, PCI 0x7d55).
+# Debian 12's own 22.3 does not, so weston and every client fall back to
+# software rendering. bookworm-backports ships 25.x.
+MESA_MIN=24
+MESA_PKGS="libgl1-mesa-dri libegl-mesa0 libglx-mesa0 libgbm1"
+mesa_stale() {
+    local pkg ver stale=""
+    for pkg in $MESA_PKGS; do
+        ver=$(pkg_version "$pkg") || ver=""
+        if [ -z "$ver" ] || dpkg --compare-versions "$ver" lt "$MESA_MIN"; then
+            stale="${stale:+$stale, }$pkg ${ver:-(missing)}"
+        fi
+    done
+    printf '%s' "$stale"
+}
+check_mesa() {
+    local stale
+    stale=$(mesa_stale)
+    [ -n "$stale" ] || return 0
+    logger -t "$LOG_TAG" "Mesa too old ($stale); installing from bookworm-backports"
+    apt_try_install -t bookworm-backports $MESA_PKGS
+    stale=$(mesa_stale)
+    [ -n "$stale" ] || return 0
+    fail "Appliance Compositor needs Mesa $MESA_MIN or newer for GPU rendering, and installing it automatically failed (details: journalctl -t $APT_TAG).
+Outdated: $stale.
+Run as root over SSH, then install again:
+apt install -t bookworm-backports $MESA_PKGS"
+}
+
+# The sound server is PipeWire (bookworm-backports, matching the libpipewire
+# weston already pulls in). PulseAudio is a second sound server fighting over
+# the same cards and Bluetooth (Debian lets both be installed, so it is only
+# caught here); refuse rather than remove someone else's.
+AUDIO_PKGS="pipewire pipewire-pulse wireplumber libspa-0.2-bluetooth pipewire-bin"
+audio_missing() {
+    local pkg missing=""
+    for pkg in $AUDIO_PKGS; do
+        pkg_installed "$pkg" || missing="${missing:+$missing, }$pkg"
+    done
+    printf '%s' "$missing"
+}
+check_audio() {
+    local missing
+    if pkg_installed pulseaudio; then
+        fail "Appliance Compositor's sound server (PipeWire) cannot run next to PulseAudio, which is installed on this system (for example by the Bluetooth or Audio Player apps).
+Uninstall the app that installed PulseAudio, or remove it as root over SSH, then install again:
+apt purge pulseaudio"
+    fi
+    missing=$(audio_missing)
+    [ -n "$missing" ] || return 0
+    logger -t "$LOG_TAG" "audio packages missing ($missing); installing from bookworm-backports"
+    apt_try_install -t bookworm-backports $AUDIO_PKGS
+    missing=$(audio_missing)
+    [ -n "$missing" ] || return 0
+    fail "Appliance Compositor needs PipeWire, and installing it automatically failed (details: journalctl -t $APT_TAG).
+Missing: $missing.
+Run as root over SSH, then install again:
+apt install -t bookworm-backports $AUDIO_PKGS"
+}
+
+check_prereqs() {
+    check_weston
+    check_mesa
+    check_audio
+}
+
+# ---- root's runtime dir ------------------------------------------------------
+#
+# weston's and PipeWire's sockets live in /run/user/0, the conventional place
+# other root programs look (e.g. pactl finds PipeWire there). That dir belongs
+# to root's user session: starting user@0 (a root SSH login, or apps that
+# start it on purpose) mounts a fresh tmpfs over it (hiding our sockets), and
+# stopping it deletes the dir. So keep root's session up from boot (linger)
+# and order our units after user-runtime-dir@0, which mounts the tmpfs;
+# whoever starts user@0 later finds it already running. A marker records that
+# we turned linger on, so uninstall only undoes our own change.
+RUNTIME_UNIT=user-runtime-dir@0.service
+LINGER_MARK=$STATE/root-linger-enabled
+# T6 Front Panel up to 1.4 did the same with its own marker; we take it over.
+LEGACY_LINGER_MARK=/var/lib/t6-paneld/root-linger-enabled
+enable_root_session() {
+    mkdir -p "$STATE"
+    if [ -e "$LEGACY_LINGER_MARK" ]; then
+        mv -f "$LEGACY_LINGER_MARK" "$LINGER_MARK"
+    elif [ ! -e /var/lib/systemd/linger/root ]; then
+        loginctl enable-linger root && touch "$LINGER_MARK"
+    fi
+    systemctl start "$RUNTIME_UNIT" 2>/dev/null || true
+}
+disable_root_session() {
+    [ -e "$LINGER_MARK" ] || return 0
+    loginctl disable-linger root 2>/dev/null || true
+    rm -f "$LINGER_MARK"
+}
+
+# Debian enables PipeWire as a per-login user service too; for root that would
+# start a second server in the same /run/user/0 (e.g. on an SSH login as
+# root). Mask those for root only.
+ROOT_USER_UNITS="pipewire.socket pipewire.service pipewire-pulse.socket pipewire-pulse.service wireplumber.service filter-chain.service"
+mask_root_user_audio() {
+    local u
+    mkdir -p /root/.config/systemd/user
+    for u in $ROOT_USER_UNITS; do
+        ln -sf /dev/null "/root/.config/systemd/user/$u"
+    done
+}
+unmask_root_user_audio() {
+    local u
+    for u in $ROOT_USER_UNITS; do
+        [ -L "/root/.config/systemd/user/$u" ] && rm -f "/root/.config/systemd/user/$u"
+    done
+}
+
+# ---- takeover from T6 Front Panel <= 1.4 --------------------------------------
+#
+# Before this package existed, the front panel ran the same PipeWire trio as
+# t6-audio*. Replace them (same programs, same runtime dir, so running clients
+# reconnect) and keep their state (default output, volumes). The panel's old
+# kiosk still starts its own weston until the panel is upgraded; meanwhile
+# appliance-compositor.service just keeps retrying (see the launcher).
+LEGACY_AUDIO_UNITS="t6-audio-pulse t6-audio-session t6-audio"
+adopt_legacy() {
+    local u
+    for u in $LEGACY_AUDIO_UNITS; do
+        [ -f "/etc/systemd/system/$u.service" ] || continue
+        logger -t "$LOG_TAG" "taking over $u from T6 Front Panel"
+        systemctl disable --now "$u" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/$u.service"
+    done
+    if [ -d /var/lib/t6-paneld/audio ] && [ ! -e "$STATE/audio" ]; then
+        mkdir -p "$STATE"
+        cp -a /var/lib/t6-paneld/audio "$STATE/audio"
+    fi
+}
+
+# ---- units --------------------------------------------------------------------
+
+audio_unit() { # name description exec [extra unit lines]
+    cat > "/etc/systemd/system/$1.service" <<UNIT
+[Unit]
+Description=$2
+Requires=$RUNTIME_UNIT
+After=$RUNTIME_UNIT
+$4
+[Service]
+Type=simple
+Environment=XDG_RUNTIME_DIR=/run/user/0
+Environment=XDG_STATE_HOME=$STATE/audio
+# our WirePlumber rules (audio/ in the repo)
+Environment=XDG_CONFIG_HOME=$TRIM_APPDEST/audio/config
+ExecStart=$3
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+}
+
+install_units() {
+    local u
+    cat > "/etc/systemd/system/$COMPOSITOR_UNIT.service" <<UNIT
+[Unit]
+Description=Appliance compositor (weston + appliance-shell)
+Requires=$RUNTIME_UNIT
+After=$RUNTIME_UNIT systemd-user-sessions.service
+# Keep retrying while another program still holds the displays.
+StartLimitIntervalSec=0
+
+[Service]
+# weston reports READY=1 (systemd-notify.so) once its socket takes clients.
+Type=notify
+NotifyAccess=main
+ExecStart=$LINK/compositor/appliance-compositor
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    audio_unit appliance-audio "Appliance sound server (PipeWire)" /usr/bin/pipewire \
+        "After=bluetooth.service"
+    audio_unit appliance-audio-session "Appliance sound session manager (WirePlumber)" \
+        "/usr/bin/wireplumber --profile main-systemwide" \
+        "BindsTo=appliance-audio.service
+After=appliance-audio.service bluetooth.service"
+    audio_unit appliance-audio-pulse "Appliance sound PulseAudio compatibility (pipewire-pulse)" \
+        /usr/bin/pipewire-pulse \
+        "BindsTo=appliance-audio.service
+After=appliance-audio.service"
+    mask_root_user_audio
+    # after the masks: linger starts root's user manager right away
+    enable_root_session
+    systemctl daemon-reload
+    for u in $UNITS; do
+        systemctl enable "$u" >/dev/null 2>&1
+    done
+}
+
+remove_units() {
+    local u
+    for u in $UNITS; do
+        systemctl disable --now "$u" >/dev/null 2>&1 || true
+        systemctl reset-failed "$u" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/$u.service"
+    done
+    unmask_root_user_audio
+    systemctl daemon-reload
+}
+
+# ---- installed paths (docs/CONTRACT.md) -------------------------------------
+
+install_paths() {
+    mkdir -p "$ETC/clients.d" "$ETC/pre-start.d" "$STATE"
+    ln -sfn "$TRIM_APPDEST" "$LINK"
+}
+
+remove_paths() {
+    rm -f "$LINK"
+    rm -rf "$ETC" "$STATE"
+}
+
+# Client apps register a fragment in clients.d; uninstalling us under them
+# would take their screens away. Name them so the user knows what to remove.
+check_no_clients() {
+    local f names=""
+    for f in "$ETC"/clients.d/*.ini; do
+        [ -f "$f" ] || continue
+        names="${names:+$names, }$(basename "$f" .ini)"
+    done
+    [ -z "$names" ] || fail "These apps use Appliance Compositor: $names.
+Uninstall them first."
+}
+
+audio_sockets_ok() {
+    local i
+    for i in $(seq 1 20); do
+        [ -S /run/user/0/pipewire-0 ] && [ -S /run/user/0/pulse/native ] && return 0
+        sleep 0.25
+    done
+    return 1
+}
+
+start_all() {
+    local u
+    [ -f "/etc/systemd/system/$COMPOSITOR_UNIT.service" ] || install_units
+    for u in $AUDIO_UNITS; do
+        systemctl start "$u" || fail "$u failed to start (journalctl -u $u)."
+    done
+    # Right after taking over from the old t6-audio units, a socket of the new
+    # server was once found unlinked (the old server's exit racing the new
+    # one's bind). Check both and restart the audio once if one is missing.
+    if ! audio_sockets_ok; then
+        logger -t "$LOG_TAG" "audio socket missing after start; restarting the sound server"
+        systemctl restart $AUDIO_UNITS
+        audio_sockets_ok || logger -t "$LOG_TAG" "audio socket still missing (journalctl -u appliance-audio)"
+    fi
+    # Don't wait: while an older app still holds the displays, the compositor
+    # keeps retrying in the background.
+    systemctl start --no-block "$COMPOSITOR_UNIT"
+}
+
+stop_all() {
+    systemctl stop $UNITS 2>/dev/null || true
+}

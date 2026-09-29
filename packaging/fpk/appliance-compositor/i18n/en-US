@@ -1,0 +1,4 @@
+[common]
+display_name="Appliance Compositor"
+desc="Shared display and sound server for screen apps (a front panel, a TV app): one Wayland compositor (weston + appliance-shell) on every display, and one PipeWire sound server. No window of its own; other apps depend on it."
+changelog="1.0.0: first release. weston 14 with appliance-shell (window stacking by rule, per-window rotation, control socket) and the appliance-screensaver, taken over from T6 Front Panel; PipeWire + WirePlumber + pipewire-pulse run system-wide. Apps register their windows and outputs in /etc/appliance-compositor/clients.d."

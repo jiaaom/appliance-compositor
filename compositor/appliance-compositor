@@ -1,0 +1,86 @@
+#!/bin/bash
+# appliance-compositor: start weston + weston-appliance-shell on every display
+# of the machine, for the client apps described in docs/CONTRACT.md.
+#
+# Run by appliance-compositor.service (Type=notify). Each start:
+#   1. runs the clients' pre-start hooks (/etc/appliance-compositor/pre-start.d),
+#      while nobody holds DRM master;
+#   2. merges our base weston.ini with the clients' fragments
+#      (/etc/appliance-compositor/clients.d/*.ini) into
+#      /var/lib/appliance-compositor/weston.ini;
+#   3. execs weston (so systemd sees weston's READY=1 and its exit status).
+#
+# If another program still drives the displays (e.g. an older front-panel app
+# with its own weston), weston fails to become DRM master and exits; systemd
+# retries until the displays are free.
+set -uo pipefail
+
+PKG=${APPLIANCE_COMPOSITOR_DIR:-$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)}
+ETC=/etc/appliance-compositor
+STATE=/var/lib/appliance-compositor
+SOCKET=wayland-appliance
+HOOK_TIMEOUT=5
+
+log() { echo "appliance-compositor: $*" >&2; }
+
+# Root's session runtime dir, kept mounted by linger (see the fpk's
+# cmd/common). Create it if we run before logind has.
+export XDG_RUNTIME_DIR=/run/user/0
+export WAYLAND_DISPLAY=$SOCKET   # also names the shell's control socket
+mkdir -p "$XDG_RUNTIME_DIR" "$STATE"
+chmod 700 "$XDG_RUNTIME_DIR"
+
+# Another weston already driving the displays (e.g. T6 Front Panel <= 1.4,
+# which started its own): don't even try — a second DRM-backend weston could
+# disturb it. Exit; systemd retries until it is gone.
+for pid in $(pgrep -x weston); do
+    args=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
+    case "$args" in
+        *--backend=drm*) case "$args" in *--socket=$SOCKET*) ;; *)
+            log "another weston (pid $pid) drives the displays; retrying later"
+            exit 75 ;;
+        esac ;;
+    esac
+done
+
+# 1. Client hooks. Failures and timeouts are logged, never fatal.
+for hook in "$ETC"/pre-start.d/*; do
+    [ -f "$hook" ] && [ -x "$hook" ] || continue
+    timeout "$HOOK_TIMEOUT" "$hook"
+    rc=$?
+    [ "$rc" -eq 0 ] || log "pre-start hook $(basename "$hook") failed (exit $rc), ignored"
+done
+
+# 2. weston.ini = base + fragments. A fragment may only contain
+# [appliance-rule] and [output] sections; other sections are dropped.
+fragment() { # file
+    awk -v f="$1" '
+        /^[[:space:]]*\[/ {
+            sec = $0; gsub(/[[:space:]\[\]]/, "", sec)
+            keep = (sec == "appliance-rule" || sec == "output")
+            if (!keep) printf "appliance-compositor: %s: section [%s] not allowed, ignored\n", f, sec > "/dev/stderr"
+        }
+        keep { print }
+    ' "$1"
+}
+conf=$STATE/weston.ini
+{
+    cat "$PKG/compositor/weston.ini"
+    for f in "$ETC"/clients.d/*.ini; do
+        [ -f "$f" ] || continue
+        printf '\n# ---- %s\n' "$f"
+        fragment "$f"
+    done
+} > "$conf.tmp" && mv -f "$conf.tmp" "$conf"
+
+# 3. The shell. It is built for one libweston major (weston 14); if the module
+# is missing, fall back to weston's kiosk-shell (windows show, no stacking
+# rules or rotation).
+shell=$PKG/shell/appliance-shell.so
+if [ ! -f "$shell" ]; then
+    log "$shell missing, using kiosk-shell"
+    shell=kiosk-shell.so
+fi
+
+exec weston --backend=drm-backend.so --socket="$SOCKET" --idle-time=0 \
+    --config="$conf" --shell="$shell" --modules=systemd-notify.so

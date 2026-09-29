@@ -1,0 +1,9 @@
+#!/bin/bash
+# Refuse while client apps still use us; otherwise stop and remove everything,
+# /etc/appliance-compositor included.
+. "$(dirname "$0")/common"
+check_no_clients
+remove_units
+disable_root_session
+remove_paths
+exit 0

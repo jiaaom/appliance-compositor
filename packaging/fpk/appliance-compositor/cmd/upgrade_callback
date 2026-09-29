@@ -1,0 +1,6 @@
+#!/bin/bash
+# Units are generated from the package paths: write them again.
+. "$(dirname "$0")/common"
+install_paths
+install_units
+exit 0
