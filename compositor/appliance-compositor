@@ -43,6 +43,23 @@ for pid in $(pgrep -x weston); do
     esac
 done
 
+# The boot splash (Plymouth) holds the displays until it quits, and weston
+# (which opens the card directly: FygoOS has no seat manager for it) takes
+# them only if they are free when it starts. The unit is ordered after
+# plymouth-quit-wait; this covers other starts: wait for the splash to end,
+# then ask it to quit.
+if command -v plymouth >/dev/null && plymouth --ping 2>/dev/null; then
+    for _ in $(seq 1 60); do
+        plymouth --ping 2>/dev/null || break
+        sleep 0.5
+    done
+    if plymouth --ping 2>/dev/null; then
+        log "boot splash still up after 30 s; asking it to quit"
+        plymouth quit
+        sleep 1
+    fi
+fi
+
 # 1. Client hooks. Failures and timeouts are logged, never fatal.
 for hook in "$ETC"/pre-start.d/*; do
     [ -f "$hook" ] && [ -x "$hook" ] || continue
@@ -82,5 +99,10 @@ if [ ! -f "$shell" ]; then
     shell=kiosk-shell.so
 fi
 
+# APPLIANCE_COMPOSITOR_EXTRA_ARGS: more weston options for debugging, e.g.
+# "--debug" (a unit drop-in; then `weston-debug drm-backend` shows how each
+# output's planes are used). Word-split on purpose.
+# shellcheck disable=SC2086
 exec weston --backend=drm-backend.so --socket="$SOCKET" --idle-time=0 \
-    --config="$conf" --shell="$shell" --modules=systemd-notify.so
+    --config="$conf" --shell="$shell" --modules=systemd-notify.so \
+    ${APPLIANCE_COMPOSITOR_EXTRA_ARGS:-}

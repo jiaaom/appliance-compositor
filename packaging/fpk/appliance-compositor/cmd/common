@@ -219,6 +219,11 @@ install_units() {
 Description=Appliance compositor (weston + appliance-shell)
 Requires=$RUNTIME_UNIT
 After=$RUNTIME_UNIT systemd-user-sessions.service
+# The boot splash holds the displays (DRM master) until it quits. weston
+# opens the card directly (no seat manager on FygoOS) and takes the displays
+# only if they are free when it starts, never later: started under the
+# splash, it would draw nothing until restarted.
+After=plymouth-quit-wait.service
 # Keep retrying while another program still holds the displays.
 StartLimitIntervalSec=0
 
