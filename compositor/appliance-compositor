@@ -69,13 +69,15 @@ for hook in "$ETC"/pre-start.d/*; do
 done
 
 # 2. weston.ini = base + fragments. A fragment may only contain
-# [appliance-rule] and [output] sections; other sections are dropped.
+# [appliance-rule] and [output] sections, and [touchscreen], which is read by
+# appliance-touch (appliance-touch.service) and not passed to weston; other
+# sections are dropped.
 fragment() { # file
     awk -v f="$1" '
         /^[[:space:]]*\[/ {
             sec = $0; gsub(/[[:space:]\[\]]/, "", sec)
             keep = (sec == "appliance-rule" || sec == "output")
-            if (!keep) printf "appliance-compositor: %s: section [%s] not allowed, ignored\n", f, sec > "/dev/stderr"
+            if (!keep && sec != "touchscreen") printf "appliance-compositor: %s: section [%s] not allowed, ignored\n", f, sec > "/dev/stderr"
         }
         keep { print }
     ' "$1"

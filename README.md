@@ -22,6 +22,9 @@ built-in screen and a TV app on the HDMI output, side by side.
   rotated. See [shell/README.md](shell/README.md).
 - **Apps stay independent:** each drops a small config fragment and an
   optional hook into `/etc/appliance-compositor/`, and ships on its own.
+- **Touchscreens on the right display:** each touchscreen is bound to the
+  display it is part of, including an external touch monitor plugged in
+  next to a built-in panel. See [docs/touchscreens.md](docs/touchscreens.md).
 - **One sound server for everything**, Bluetooth included, with state kept
   across reboots.
 - **A screensaver client** (`appliance-screensaver`) and a control tool
@@ -68,6 +71,8 @@ ninja, and the weston 14 dev headers. See
 - [CONTRACT.md](docs/CONTRACT.md): what client apps may rely on.
 - [Architecture](docs/architecture.md): the units, the launcher, root's
   runtime directory, sound, files on the system.
+- [Touchscreens](docs/touchscreens.md): which display each touchscreen
+  drives, and how to configure it.
 - [Installation](docs/installation.md): system packages, removal,
   upgrades, taking over from T6 Front Panel ≤ 1.4.
 - [Development](docs/development.md): repository layout, build.

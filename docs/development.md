@@ -6,8 +6,9 @@
 shell/        weston-appliance-shell: the weston shell plugin (stacking by
               rule, per-window rotation, control socket) and
               appliance-screensaver; see shell/README.md
-compositor/   the launcher (hooks, config merge, exec weston) and the base
-              weston.ini
+compositor/   the launcher (hooks, config merge, exec weston), the base
+              weston.ini, and appliance-touch (the touchscreen mapper)
+tests/        appliance-touch decision tests (python3 -m unittest discover -s tests)
 audio/        WirePlumber rules for the sound server
 packaging/    build-fpk.sh, the FygoOS package skeleton (fpk/), icon generator
 docs/         the runtime contract, architecture, installation, this file

@@ -27,6 +27,7 @@ package they are windows on the same compositor, placed by rule.
 | `…/client.env` | the client environment below, `KEY=value` lines (systemd `EnvironmentFile=`, or `set -a; . file`) |
 | `…/bin/appliance-shell-ctl` | control-socket client (see `shell/README.md`, "Control socket") |
 | `…/bin/appliance-screensaver` | black input-catching screen (see `shell/README.md`) |
+| `…/bin/appliance-touch` | touchscreen mapper: `status [--json]`, `forget` (see `docs/touchscreens.md`); since 1.2.0 |
 | `/etc/appliance-compositor/clients.d/` | per-client compositor config (below) |
 | `/etc/appliance-compositor/pre-start.d/` | per-client hooks run before the compositor takes the displays (below) |
 
@@ -56,6 +57,7 @@ directory is mounted once and never hidden or removed by a later root login.
 | unit | role |
 |---|---|
 | `appliance-compositor.service` | weston. `Type=notify`: active once the socket accepts clients |
+| `appliance-touch.service` | binds each touchscreen to its display (since 1.2.0); started and restarted with the compositor |
 | `appliance-audio.service` | PipeWire |
 | `appliance-audio-session.service` | WirePlumber (session manager, system-wide profile) |
 | `appliance-audio-pulse.service` | pipewire-pulse (PulseAudio protocol) |
@@ -80,14 +82,26 @@ and for sound `Wants=`/`After=appliance-audio-pulse.service`.
 
 ## `clients.d/<client>.ini`
 
-weston.ini fragments, one file per client package, named after it. Only two
-section types are allowed; anything else is ignored with a warning:
+weston.ini fragments, one file per client package, named after it. Only
+these section types are allowed; anything else is ignored with a warning:
 
 - `[appliance-rule]` — window placement for the client's app-ids (keys in
   `shell/README.md`: `app-id`, `layer`, `rotation`, `focusable`,
   `focus-priority`, `output`, `output-fallback`).
 - `[output]` — settings for an output the client owns (weston's keys:
   `name`, `scale`, `transform`, `mode`, …).
+- `[touchscreen]` (since 1.2.0) — which output a touchscreen is on:
+  `name=` (glob on the input device name) and/or
+  `usb=vendor:product[:serial]`, and `output=` (an output name, or `none`).
+  Read by `appliance-touch`, not passed to weston; older compositors drop it
+  with a warning.
+
+Touchscreens: the compositor binds each touchscreen to a display by itself
+when it can tell which one it is (an external touch monitor next to a
+built-in panel needs no configuration; see `docs/touchscreens.md`). A client
+that owns a built-in touchscreen declares it with `[touchscreen]`, so the
+compositor never hands that display to another touchscreen. An existing udev
+rule that sets `WL_OUTPUT` is respected as well.
 
 Layer numbers: `0–49` clients' normal windows, `50–99` overlays, `100` and up
 screensavers. A client that runs `appliance-screensaver` for its own screen

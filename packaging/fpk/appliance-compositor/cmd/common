@@ -6,8 +6,11 @@ ETC=/etc/appliance-compositor
 STATE=/var/lib/appliance-compositor
 LINK=/usr/local/lib/appliance-compositor
 COMPOSITOR_UNIT=appliance-compositor
+TOUCH_UNIT=appliance-touch
 AUDIO_UNITS="appliance-audio appliance-audio-session appliance-audio-pulse"
-UNITS="$COMPOSITOR_UNIT $AUDIO_UNITS"
+UNITS="$COMPOSITOR_UNIT $TOUCH_UNIT $AUDIO_UNITS"
+# written by appliance-touch at run time (docs/touchscreens.md)
+TOUCH_RULES=/run/udev/rules.d/71-appliance-touch.rules
 LOG_TAG=appliance-compositor
 
 fail() {
@@ -113,7 +116,19 @@ Run as root over SSH, then install again:
 apt install -t bookworm-backports $AUDIO_PKGS"
 }
 
+# appliance-touch and appliance-shell-ctl are Python 3 scripts (stdlib only).
+check_python() {
+    command -v python3 >/dev/null && return 0
+    logger -t "$LOG_TAG" "python3 missing; installing"
+    apt_try_install python3
+    command -v python3 >/dev/null && return 0
+    fail "Appliance Compositor needs Python 3, and installing it automatically failed (details: journalctl -t $APT_TAG).
+Run as root over SSH, then install again:
+apt install python3"
+}
+
 check_prereqs() {
+    check_python
     check_weston
     check_mesa
     check_audio
@@ -219,6 +234,10 @@ install_units() {
 Description=Appliance compositor (weston + appliance-shell)
 Requires=$RUNTIME_UNIT
 After=$RUNTIME_UNIT systemd-user-sessions.service
+# Touchscreens get their display (udev WL_OUTPUT) before weston opens them;
+# not Requires=: weston runs without it, only the mapping is missing.
+Wants=$TOUCH_UNIT.service
+After=$TOUCH_UNIT.service
 # The boot splash holds the displays (DRM master) until it quits. weston
 # opens the card directly (no seat manager on FygoOS) and takes the displays
 # only if they are free when it starts, never later: started under the
@@ -232,6 +251,28 @@ StartLimitIntervalSec=0
 Type=notify
 NotifyAccess=main
 ExecStart=$LINK/compositor/appliance-compositor
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+    cat > "/etc/systemd/system/$TOUCH_UNIT.service" <<UNIT
+[Unit]
+Description=Appliance touchscreen mapper (which display each touchscreen is on)
+After=systemd-udevd.service systemd-udev-trigger.service
+Before=$COMPOSITOR_UNIT.service
+# restarted with the compositor, so a restart re-reads clients.d as well
+PartOf=$COMPOSITOR_UNIT.service
+
+[Service]
+# READY=1 after the first pass (rules written); it never holds weston up
+# for long: failures are logged and it reports ready anyway.
+Type=notify
+NotifyAccess=main
+TimeoutStartSec=20
+ExecStart=$LINK/bin/appliance-touch run
+ExecReload=/bin/kill -HUP \$MAINPID
 Restart=on-failure
 RestartSec=3
 
@@ -264,6 +305,10 @@ remove_units() {
         systemctl reset-failed "$u" >/dev/null 2>&1 || true
         rm -f "/etc/systemd/system/$u.service"
     done
+    if [ -f "$TOUCH_RULES" ]; then
+        rm -f "$TOUCH_RULES"
+        udevadm control --reload 2>/dev/null || true
+    fi
     unmask_root_user_audio
     systemctl daemon-reload
 }

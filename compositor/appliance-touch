@@ -1,0 +1,544 @@
+#!/usr/bin/python3
+"""appliance-touch: bind each touchscreen to the display it belongs to.
+
+    appliance-touch run            the daemon (appliance-touch.service)
+    appliance-touch apply          one pass of the daemon's work, then exit
+    appliance-touch status [--json]
+    appliance-touch forget [all | <device id>]
+
+Why: a touchscreen only reports where on itself it was touched; the
+compositor has to know which display that surface covers. weston reads this
+from the device's udev property WL_OUTPUT (an output name such as "DP-2"),
+once, when the device appears. A device without it is bound to weston's
+first output, so an external touch monitor would steer the built-in screen.
+
+What it does: it watches input and display hot-plugs, decides an output for
+every touchscreen (with the other input nodes of the same physical device,
+e.g. the pen or mouse interface of the same USB device), writes the result
+as udev rules into RULES and replays a remove + add uevent for each node
+whose binding changed, so the running weston reads it again. Decisions, in
+order (see docs/touchscreens.md):
+
+  1. udev rule   another udev rule (an app's or the administrator's) already
+                 sets WL_OUTPUT: respected, and its output is taken;
+  2. config      a [touchscreen] section in clients.d/*.ini matches it;
+  3. remembered  it was paired with a monitor before (by USB serial and
+                 EDID), on whichever connector that monitor is now; while
+                 the monitor is not connected the device is bound to no
+                 output (touches go nowhere instead of to another screen);
+  4. only free display
+                 it is the only unbound touchscreen and exactly one connected
+                 display has no touchscreen yet: paired. Remembered only if
+                 the two appeared within TOGETHER seconds of each other while
+                 the daemon was watching (a touch monitor being plugged in);
+                 a coincidence, such as a TV next to a touch monitor whose
+                 video cable is not connected, must not stick;
+  otherwise it is left to weston (its first output), or bound to no output
+  when every connected display already has a touchscreen.
+"""
+import fcntl
+import fnmatch
+import glob
+import json
+import os
+import selectors
+import signal
+import socket
+import subprocess
+import sys
+import time
+
+ETC = "/etc/appliance-compositor"
+STATE = "/var/lib/appliance-compositor"
+MEMORY = os.path.join(STATE, "touch.json")
+LOCK = os.path.join(STATE, "touch.lock")
+RULES = "/run/udev/rules.d/71-appliance-touch.rules"
+UNIT = "appliance-touch.service"
+# WL_OUTPUT for "bound to no output": no connector has this name, so weston
+# keeps the device unbound and drops its touches. Also the config value.
+NO_OUTPUT = "none"
+MARK = "APPLIANCE_TOUCH_OUTPUT"   # set next to WL_OUTPUT by our rules
+DEBOUNCE = 0.5                    # s of quiet after a hot-plug burst
+TOGETHER = 15                     # s between a touchscreen and a display
+                                  # appearing, to remember them as one monitor
+
+
+def log(msg):
+    print(f"appliance-touch: {msg}", file=sys.stderr, flush=True)
+
+
+def read(path, mode="r"):
+    try:
+        with open(path, mode) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+# ---- config ----------------------------------------------------------------
+
+def read_ini(path):
+    """[(section, {key: value}), ...] in file order; repeated sections kept."""
+    out, cur = [], None
+    for line in (read(path) or "").splitlines():
+        line = line.strip()
+        if not line or line[0] in "#;":
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            cur = {}
+            out.append((line[1:-1].strip(), cur))
+        elif "=" in line and cur is not None:
+            k, v = line.split("=", 1)
+            cur[k.strip()] = v.strip()
+    return out
+
+
+def config_rules():
+    rules = []
+    for path in sorted(glob.glob(os.path.join(ETC, "clients.d", "*.ini"))):
+        for sec, kv in read_ini(path):
+            if sec != "touchscreen":
+                continue
+            where = os.path.basename(path)
+            if not kv.get("output"):
+                log(f"{where}: [touchscreen] without output=, ignored")
+                continue
+            if not kv.get("name") and not kv.get("usb"):
+                log(f"{where}: [touchscreen] needs name= or usb=, ignored")
+                continue
+            rules.append({"name": kv.get("name"), "usb": kv.get("usb"),
+                          "output": kv["output"], "file": where})
+    return rules
+
+
+def rule_matches(rule, dev):
+    if rule["name"] and not any(fnmatch.fnmatchcase(n["name"], rule["name"])
+                                for n in dev["nodes"]):
+        return False
+    if rule["usb"]:
+        want = rule["usb"].lower().split(":")
+        if not dev["usb"] or len(want) < 2:
+            return False
+        have = [dev["usb"]["vid"], dev["usb"]["pid"], dev["usb"]["serial"].lower()]
+        if want != have[:len(want)]:
+            return False
+    return True
+
+
+# ---- memory (pairings found earlier) ----------------------------------------
+
+class Locked:
+    """flock around read-modify-write of MEMORY (daemon vs `forget`)."""
+    def __enter__(self):
+        os.makedirs(STATE, exist_ok=True)
+        self.f = open(LOCK, "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+    def __exit__(self, *a):
+        self.f.close()
+
+
+def load_memory():
+    try:
+        data = json.loads(read(MEMORY) or "{}")
+        return data.get("pairs", {}) if isinstance(data, dict) else {}
+    except ValueError:
+        log(f"{MEMORY} unreadable, starting empty")
+        return {}
+
+
+def save_memory(pairs):
+    tmp = MEMORY + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"version": 1, "pairs": pairs}, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, MEMORY)
+
+
+# ---- what is plugged in ----------------------------------------------------
+
+def udev_props(syspath):
+    try:
+        out = subprocess.run(["udevadm", "info", "--query=property", "--path", syspath],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    return dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+
+
+def physical_root(input_dir):
+    """The physical device an input device belongs to: its USB device, or
+    else the input device's parent device (an i2c/HID device). Interfaces of
+    one USB device (touch, pen, mouse) share it."""
+    parent = os.path.realpath(os.path.join(input_dir, "device"))
+    d = parent
+    while d.startswith("/sys/devices/"):
+        if all(os.path.exists(os.path.join(d, f)) for f in ("idVendor", "idProduct", "busnum")):
+            return d
+        d = os.path.dirname(d)
+    return parent
+
+
+def scan_devices():
+    """{root: device} for physical devices with at least one touchscreen node."""
+    devs = {}
+    for ev in sorted(glob.glob("/sys/class/input/event*")):
+        try:
+            input_dir = os.path.realpath(os.path.join(ev, "device"))
+        except OSError:
+            continue
+        if input_dir.startswith("/sys/devices/virtual/"):
+            continue   # uinput (remotes, injected input): not a screen
+        root = physical_root(input_dir)
+        dev = devs.setdefault(root, {"root": root, "nodes": [], "touch": False})
+        props = udev_props(ev)
+        node = {"syspath": ev, "event": os.path.basename(ev),
+                "name": (read(os.path.join(input_dir, "name")) or "").strip(),
+                "touch": props.get("ID_INPUT_TOUCHSCREEN") == "1",
+                "wl_output": props.get("WL_OUTPUT"), "mark": props.get(MARK)}
+        dev["nodes"].append(node)
+        dev["touch"] |= node["touch"]
+    devs = {r: d for r, d in devs.items() if d["touch"]}
+    for root, d in devs.items():
+        d["name"] = next(n["name"] for n in d["nodes"] if n["touch"])
+        vid = (read(os.path.join(root, "idVendor")) or "").strip()
+        if vid:
+            d["usb"] = {"vid": vid, "pid": (read(os.path.join(root, "idProduct")) or "").strip(),
+                        "serial": (read(os.path.join(root, "serial")) or "").strip()}
+            u = d["usb"]
+            d["id"] = (f"usb:{u['vid']}:{u['pid']}:{u['serial']}" if u["serial"]
+                       else f"usb:{u['vid']}:{u['pid']}@{os.path.basename(root)}")
+        else:
+            d["usb"] = None
+            d["id"] = f"dev:{os.path.basename(root)}"
+        # Bound by a udev rule that is not ours (ours always sets MARK equal).
+        foreign = {n["wl_output"] for n in d["nodes"]
+                   if n["wl_output"] and n["wl_output"] != n["mark"]}
+        d["foreign"] = sorted(foreign)[0] if foreign else None
+    return devs
+
+
+def edid_info(edid):
+    """(stable id, display name) of a monitor, or (None, None)."""
+    if not edid or len(edid) < 128 or edid[:8] != b"\x00\xff\xff\xff\xff\xff\xff\x00":
+        return None, None
+    m = (edid[8] << 8) | edid[9]
+    mfg = "".join(chr(((m >> s) & 31) + 64) for s in (10, 5, 0))
+    product = edid[10] | (edid[11] << 8)
+    serial = str(int.from_bytes(edid[12:16], "little"))
+    name = None
+    for off in (54, 72, 90, 108):
+        blk = edid[off:off + 18]
+        if blk[:3] != b"\x00\x00\x00":
+            continue
+        text = blk[5:18].split(b"\n")[0].decode("ascii", "replace").strip(" \x00")
+        if blk[3] == 0xFF and text:
+            serial = text
+        elif blk[3] == 0xFC and text:
+            name = text
+    return f"{mfg}:{product:04x}:{serial}", name or mfg
+
+
+def scan_outputs():
+    """{connector name: {"id", "monitor"}} for connected displays. weston names
+    outputs after the kernel's connectors (sysfs card1-DP-2 → "DP-2")."""
+    outs = {}
+    for d in sorted(glob.glob("/sys/class/drm/card*-*")):
+        if (read(os.path.join(d, "status")) or "").strip() != "connected":
+            continue
+        name = os.path.basename(d).split("-", 1)[1]
+        if name.startswith("Writeback") or name in outs:
+            continue
+        ident, monitor = edid_info(read(os.path.join(d, "edid"), "rb"))
+        outs[name] = {"id": ident, "monitor": monitor}
+    return outs
+
+
+# ---- the decision ------------------------------------------------------------
+
+class Seen:
+    """When the daemon first saw each touchscreen and each display (None:
+    already there when it started, so nothing is known about it). A touch
+    monitor being plugged in shows up as both appearing close together: the
+    touch controller is usually powered by the monitor, or the user plugs
+    both cables at once."""
+    def __init__(self):
+        self.dev = self.out = None
+
+    def update(self, devs, outs, now=None):
+        now = time.monotonic() if now is None else now
+        dev_keys = {d["id"] for d in devs.values()}
+        out_keys = {(n, o["id"]) for n, o in outs.items()}
+        if self.dev is None:
+            self.dev, self.out = dict.fromkeys(dev_keys), dict.fromkeys(out_keys)
+        else:
+            self.dev = {k: self.dev.get(k, now) for k in dev_keys}
+            self.out = {k: self.out.get(k, now) for k in out_keys}
+
+    def together(self, dev_id, conn, monitor_id):
+        a = (self.dev or {}).get(dev_id)
+        b = (self.out or {}).get((conn, monitor_id))
+        return a is not None and b is not None and abs(a - b) <= TOGETHER
+
+
+def decide(devs, outs, rules, memory, seen=None):
+    """Sets dev["output"] (a name, NO_OUTPUT, or None = left to weston) and
+    dev["why"]. Returns (memory entries to add or update, standby rules).
+    seen (a Seen) decides whether a rule-4 pairing is remembered."""
+    claimed = {r["output"] for r in rules}
+    learned = {}
+    for d in devs.values():
+        d["output"], d["why"], d["ours"] = None, None, True
+        if d["foreign"]:
+            d["output"], d["why"], d["ours"] = d["foreign"], "udev rule", False
+            claimed.add(d["foreign"])
+            continue
+        rule = next((r for r in rules if rule_matches(r, d)), None)
+        if rule:
+            d["output"], d["why"] = rule["output"], f"config ({rule['file']})"
+    by_monitor = {o["id"]: n for n, o in outs.items() if o["id"]}
+    for d in devs.values():
+        mem = memory.get(d["id"])
+        if d["why"] or not mem:
+            continue
+        conn = by_monitor.get(mem.get("monitor"))
+        if conn and conn not in claimed:
+            d["output"], d["why"] = conn, f"remembered ({mem.get('monitor_name') or mem['monitor']})"
+            claimed.add(conn)
+            if mem.get("connector") != conn:
+                learned[d["id"]] = dict(mem, connector=conn)
+        elif not conn:
+            d["output"] = NO_OUTPUT
+            d["why"] = f"remembered display not connected ({mem.get('monitor_name') or mem['monitor']})"
+        # else: its monitor is now claimed by config; config wins, fall through
+    loose = [d for d in devs.values() if not d["why"]]
+    free = [n for n in outs if n not in claimed]
+    if len(loose) == 1 and len(free) == 1:
+        d, conn = loose[0], free[0]
+        d["output"], d["why"] = conn, "only free display"
+        if outs[conn]["id"] and seen and seen.together(d["id"], conn, outs[conn]["id"]):
+            d["why"] += "; plugged in together, remembered"
+            learned[d["id"]] = {"monitor": outs[conn]["id"], "monitor_name": outs[conn]["monitor"],
+                                "connector": conn, "device_name": d["name"],
+                                "since": time.strftime("%Y-%m-%d %H:%M:%S")}
+    elif loose and not free:
+        for d in loose:
+            d["output"], d["why"] = NO_OUTPUT, "no free display"
+    else:
+        for d in loose:
+            d["why"] = (f"ambiguous ({len(loose)} touchscreens, {len(free)} free displays); "
+                        "left to weston")
+    return learned, standby(devs, outs, memory, claimed)
+
+
+def standby(devs, outs, memory, claimed):
+    """Rules for remembered USB devices (with a serial number) that are not
+    plugged in, so that when one is, udev binds it at once, before weston
+    opens it, instead of after our next pass."""
+    present = {d["id"] for d in devs.values()}
+    by_monitor = {o["id"]: n for n, o in outs.items() if o["id"]}
+    out = []
+    for ident, mem in sorted(memory.items()):
+        parts = ident.split(":")
+        if ident in present or len(parts) != 4 or parts[0] != "usb" or not parts[3]:
+            continue
+        conn = by_monitor.get(mem.get("monitor"))
+        output = conn if conn and conn not in claimed else NO_OUTPUT
+        out.append({"id": ident, "name": mem.get("device_name", "?"), "output": output,
+                    "usb": {"vid": parts[1], "pid": parts[2], "serial": parts[3]},
+                    "why": f"standby, remembered ({mem.get('monitor_name') or mem.get('monitor')})"})
+    return out
+
+
+# ---- applying it -------------------------------------------------------------
+
+def udev_quote(s):
+    return s.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def render_rules(devs, standby_rules=()):
+    lines = ["# Generated by appliance-touch (appliance-compositor); rewritten on every",
+             "# input or display hot-plug. Do not edit: see docs/touchscreens.md.", ""]
+    present = [d for d in sorted(devs.values(), key=lambda d: d["root"])
+               if d["ours"] and d["output"] is not None]
+    for d in [*present, *standby_rules]:
+        u = d["usb"]
+        if u and u["serial"]:
+            # by identity (all ATTRS of one rule must match the same parent),
+            # so it still holds on another port
+            match = (f'ATTRS{{idVendor}}=="{u["vid"]}", ATTRS{{idProduct}}=="{u["pid"]}", '
+                     f'ATTRS{{serial}}=="{udev_quote(u["serial"])}"')
+        else:
+            match = f'DEVPATH=="{udev_quote(d["root"][len("/sys"):])}/*"'
+        lines.append(f"# {d['name']} ({d['id']}): {d['why']}")
+        lines.append(f'SUBSYSTEM=="input", KERNEL=="event*", {match}, '
+                     f'ENV{{WL_OUTPUT}}="{d["output"]}", ENV{{{MARK}}}="{d["output"]}"')
+    return "\n".join(lines) + "\n"
+
+
+def udevadm(*args):
+    subprocess.run(["udevadm", *args], check=False, timeout=30,
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def apply(devs, standby_rules):
+    text = render_rules(devs, standby_rules)
+    if read(RULES) != text:
+        os.makedirs(os.path.dirname(RULES), exist_ok=True)
+        with open(RULES + ".tmp", "w") as f:
+            f.write(text)
+        os.replace(RULES + ".tmp", RULES)
+        udevadm("control", "--reload")
+    # Nodes whose udev properties differ from the rules: replay remove + add,
+    # which makes udev re-run the rules and weston (libinput) drop and re-add
+    # the device, reading WL_OUTPUT again. weston keeps running.
+    stale = [n["syspath"] for d in devs.values() if d["ours"] for n in d["nodes"]
+             if n["mark"] != d["output"]]
+    if stale:
+        udevadm("trigger", "--settle", "--action=remove", *stale)
+        udevadm("trigger", "--settle", "--action=add", *stale)
+    return stale
+
+
+def summary(devs):
+    return "; ".join(f"{d['name']} ({d['id']}) -> {d['output'] or 'weston default'}: {d['why']}"
+                     for d in sorted(devs.values(), key=lambda d: d["root"])) or "no touchscreens"
+
+
+def reconcile(last=None, seen=None):
+    with Locked():
+        memory = load_memory()
+        devs, outs = scan_devices(), scan_outputs()
+        if seen:
+            seen.update(devs, outs)
+        learned, standby_rules = decide(devs, outs, config_rules(), memory, seen)
+        if learned:
+            memory.update(learned)
+            save_memory(memory)
+    stale = apply(devs, standby_rules)
+    s = summary(devs)
+    if s != last or stale:
+        log(s)
+    if stale:
+        log("rebound: " + ", ".join(os.path.basename(p) for p in stale))
+    return s
+
+
+# ---- commands -----------------------------------------------------------------
+
+def sd_notify(msg):
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+        s.connect(addr)
+        s.sendall(msg.encode())
+
+
+def cmd_run():
+    sel = selectors.DefaultSelector()
+    r, w = os.pipe()
+    os.set_blocking(w, False)
+    signal.signal(signal.SIGHUP, lambda *a: os.write(w, b"h"))
+    signal.signal(signal.SIGTERM, lambda *a: sys.exit(0))
+    # Start listening before the first pass, so no hot-plug falls in between.
+    mon = subprocess.Popen(["udevadm", "monitor", "--udev",
+                            "--subsystem-match=input", "--subsystem-match=drm"],
+                           stdout=subprocess.PIPE, text=True, bufsize=1)
+    sel.register(mon.stdout, selectors.EVENT_READ)
+    sel.register(r, selectors.EVENT_READ)
+    last, seen = None, Seen()
+    try:
+        last = reconcile(seen=seen)
+    except Exception as e:   # never hold up the compositor's start
+        log(f"first pass failed: {e!r}")
+    sd_notify("READY=1")
+    due = None
+    while True:
+        timeout = None if due is None else max(0.0, due - time.monotonic())
+        for key, _ in sel.select(timeout):
+            if key.fileobj is mon.stdout:
+                line = mon.stdout.readline()
+                if not line:
+                    log("udevadm monitor exited")
+                    return 1
+                if line.startswith("UDEV"):
+                    due = time.monotonic() + DEBOUNCE
+            else:
+                os.read(r, 64)
+                due = time.monotonic()   # reload: now
+        if due is not None and time.monotonic() >= due:
+            due = None
+            try:
+                last = reconcile(last, seen)
+            except Exception as e:
+                log(f"reconcile failed: {e!r}")
+
+
+def cmd_status(as_json):
+    memory = load_memory()
+    devs, outs = scan_devices(), scan_outputs()
+    decide(devs, outs, config_rules(), memory)
+    if as_json:
+        print(json.dumps({
+            "touchscreens": [{"id": d["id"], "name": d["name"], "output": d["output"],
+                              "why": d["why"], "nodes": [n["event"] for n in d["nodes"]],
+                              "bound": [n["wl_output"] for n in d["nodes"]]}
+                             for d in devs.values()],
+            "outputs": outs, "remembered": memory}, indent=2))
+        return 0
+    print("Touchscreens:")
+    for d in devs.values():
+        now = sorted({n["wl_output"] or "weston default" for n in d["nodes"]})
+        print(f"  {d['name']}  [{d['id']}]")
+        print(f"    -> {d['output'] or 'weston default'}: {d['why']}")
+        print(f"    nodes {', '.join(n['event'] for n in d['nodes'])}, now bound to {', '.join(now)}")
+    if not devs:
+        print("  (none)")
+    print("Connected displays:")
+    for n, o in outs.items():
+        print(f"  {n}: {o['monitor'] or '?'}  [{o['id'] or 'no EDID'}]")
+    print("Remembered pairings:")
+    for k, v in memory.items():
+        print(f"  {v.get('device_name', '?')} [{k}] -> {v.get('monitor_name', '?')} "
+              f"[{v['monitor']}], last on {v.get('connector', '?')}")
+    if not memory:
+        print("  (none)")
+    return 0
+
+
+def cmd_forget(what):
+    with Locked():
+        memory = load_memory()
+        if what == "all":
+            gone = list(memory)
+            memory = {}
+        elif what in memory:
+            gone = [what]
+            del memory[what]
+        else:
+            print(f"no remembered pairing for {what!r} (see: appliance-touch status)", file=sys.stderr)
+            return 1
+        save_memory(memory)
+    print("forgot: " + (", ".join(gone) or "nothing"))
+    subprocess.run(["systemctl", "reload", UNIT], check=False, stderr=subprocess.DEVNULL)
+    return 0
+
+
+def main(argv):
+    if argv[:1] == ["run"]:
+        return cmd_run()
+    if argv[:1] == ["apply"]:
+        reconcile()
+        return 0
+    if argv[:1] == ["status"]:
+        return cmd_status("--json" in argv[1:])
+    if argv[:1] == ["forget"] and len(argv) == 2:
+        return cmd_forget(argv[1])
+    print(__doc__.split("\n\n")[1], file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

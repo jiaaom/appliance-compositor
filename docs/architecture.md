@@ -12,6 +12,7 @@ All run as root, from boot (`multi-user.target`).
 | unit | runs |
 |---|---|
 | `appliance-compositor.service` | weston with appliance-shell, through the launcher (below); `Type=notify` via weston's `systemd-notify.so`, so clients start once its socket takes connections |
+| `appliance-touch.service` | `bin/appliance-touch run`: binds each touchscreen to its display through udev `WL_OUTPUT`; before the compositor, `PartOf=` it; see [touchscreens.md](touchscreens.md) |
 | `appliance-audio.service` | `pipewire`, the sound server |
 | `appliance-audio-session.service` | `wireplumber --profile main-systemwide`, the session manager |
 | `appliance-audio-pulse.service` | `pipewire-pulse`, for apps that speak the PulseAudio protocol (Chromium/Electron among them) |
@@ -36,7 +37,8 @@ Each start:
 3. **Config:** merge the base `compositor/weston.ini` with the clients'
    fragments (`/etc/appliance-compositor/clients.d/*.ini`) into
    `/var/lib/appliance-compositor/weston.ini`.
-   - A fragment may contain only `[output]` and `[appliance-rule]` sections;
+   - A fragment may contain only `[output]` and `[appliance-rule]` sections,
+     plus `[touchscreen]`, which is for appliance-touch and not copied;
      anything else is dropped with a log line.
 4. **Shell:** `exec weston` with appliance-shell, on the `wayland-appliance`
    socket.
@@ -82,9 +84,11 @@ So the package handles it as follows:
 
 | path | what |
 |---|---|
-| `/usr/local/lib/appliance-compositor` | link to the installed package; `CONTRACT`, `client.env`, `bin/appliance-shell-ctl`, `bin/appliance-screensaver` |
+| `/usr/local/lib/appliance-compositor` | link to the installed package; `CONTRACT`, `client.env`, `bin/appliance-shell-ctl`, `bin/appliance-screensaver`, `bin/appliance-touch` |
 | `/etc/appliance-compositor/clients.d/<app>.ini` | the clients' fragments (window rules, output settings) |
 | `/etc/appliance-compositor/pre-start.d/<app>` | the clients' hooks |
 | `/var/lib/appliance-compositor/weston.ini` | the merged configuration of the last start |
 | `/var/lib/appliance-compositor/audio/` | PipeWire / WirePlumber state |
+| `/var/lib/appliance-compositor/touch.json` | remembered touchscreen ↔ monitor pairings |
+| `/run/udev/rules.d/71-appliance-touch.rules` | appliance-touch's current decisions as udev rules (regenerated; gone at reboot) |
 | `/run/user/0/wayland-appliance` | the Wayland socket; `wayland-appliance.appliance-shell` is the shell's control socket |

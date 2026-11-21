@@ -36,6 +36,12 @@ rm -rf "$bdir"
 cp "$bdir/appliance-shell.so" "$REPO/shell/LICENSE" "$app/shell/"
 cp "$bdir/appliance-screensaver" "$REPO/shell/tools/appliance-shell-ctl" "$app/bin/"
 
+# The touchscreen mapper (appliance-touch.service), after its tests.
+log "testing appliance-touch"
+python3 -m unittest discover -s "$REPO/tests" >/dev/null 2>&1 \
+    || die "appliance-touch tests failed (python3 -m unittest discover -s tests)"
+cp "$REPO/compositor/appliance-touch" "$app/bin/"
+
 # The launcher and its base config, the WirePlumber rules.
 cp "$REPO/compositor/appliance-compositor" "$REPO/compositor/weston.ini" "$app/compositor/"
 cp -r "$REPO/audio/wireplumber" "$app/audio/config/"
